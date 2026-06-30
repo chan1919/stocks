@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """估值表数据采集与计算管道.
-A 股: 新浪源 (stock_financial_abstract / stock_zh_a_daily) - 本地可用, 已验证.
-港股: 东方财富财务(英文列) + 网易行情(stock_hk_daily) - 本地与 Actions 均可用.
-美股: 东方财富财务(英文列) + 网易行情(stock_us_daily) - 本地与 Actions 均可用.
+股票池由 README.md 维护 (parse_readme), 每行 `代码 中文名 [股本]`.
+A 股: 新浪源 (stock_financial_abstract / stock_zh_a_daily) + 东方财富个股信息查总股本.
+港股: 东方财富财务(英文列) + 网易行情(stock_hk_daily); 股本由 README 手填(无自动接口).
+美股: 东方财富财务(英文列) + 网易行情(stock_us_daily); 股本由 README 手填.
 跨市场币种: 港股价 HKD、美股股价 USD; 财务利润按报告币种(中概股多为 CNY).
 市值与利润统一按 fx_spot_quote 当日汇率折算为人民币(亿), 保证 PE 可比.
+股本缓存 data/shares_cache.json 为 A 股自动查兜底.
 输出: data/valuation.json
 """
 import json
+import os
 import time
 import traceback
 from datetime import datetime
@@ -15,7 +18,61 @@ from datetime import datetime
 import akshare as ak
 import pandas as pd
 
-from config import STOCKS
+
+# ---------- 股票池解析 (README 驱动) ----------
+README_PATH = "README.md"
+CACHE_PATH = "data/shares_cache.json"
+
+# 分组标题 -> 市场代码
+SECTION_MARKET = {"a股": "A", "港股": "HK", "美股": "US"}
+
+
+def parse_readme(path=README_PATH):
+    """解析 README.md 的股票池, 返回 [(code, market, name, shares_opt), ...].
+    每行格式: `代码 中文名 [股本]`, 股本可省略(亿股). 按 ## 分组识别市场.
+    """
+    stocks = []
+    market = None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("##"):
+                head = s.lstrip("#").strip().lower()
+                market = SECTION_MARKET.get(head)
+                continue
+            if market is None:
+                continue  # 说明区(标题/表格/列表/分割线)跳过
+            parts = s.split()
+            if len(parts) < 2:
+                continue
+            code, name = parts[0], parts[1]
+            shares = None
+            if len(parts) >= 3:
+                try:
+                    shares = float(parts[2])
+                except ValueError:
+                    shares = None
+            stocks.append((code, market, name, shares))
+    return stocks
+
+
+def load_cache(path=CACHE_PATH):
+    """读取股本缓存 {code: shares_yi}."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cache(cache, path=CACHE_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
 
 
 # ---------- 工具函数 ----------
@@ -81,6 +138,20 @@ def fx_rates():
         pass
     _FX = rates
     return rates
+
+
+def get_shares_a(code, fallback=None):
+    """A 股总股本(亿股): 优先 stock_individual_info_em 单只接口自动查最新值.
+    查不到时返回 fallback(README 手填或缓存值). 港股/美股无自动接口, 不调用本函数.
+    """
+    try:
+        df = with_retry(lambda: ak.stock_individual_info_em(symbol=code))
+        row = df[df["item"] == "总股本"]
+        if not row.empty:
+            return clean_number(row["value"].iloc[0]) / 1e8  # 股 -> 亿股
+    except Exception:
+        pass
+    return fallback
 
 
 # ---------- A 股 ----------
@@ -209,18 +280,34 @@ def process_one(stock):
 
 
 def main():
+    stocks = parse_readme()
+    if not stocks:
+        print("README.md 未解析到任何股票, 请检查股票池格式.", flush=True)
+        return
+    cache = load_cache()
     results = []
     failed = []
-    for i, stock in enumerate(STOCKS, 1):
-        code, market, name, _ = stock
-        print(f"[{i}/{len(STOCKS)}] {name} ({market}:{code}) ...", flush=True)
+    for i, (code, market, name, shares_readme) in enumerate(stocks, 1):
+        print(f"[{i}/{len(stocks)}] {name} ({market}:{code}) ...", flush=True)
         try:
-            rec = process_one(stock)
+            # 确定股本(亿股): A 股自动查 -> README 手填 -> 缓存 -> 跳过
+            if market == "A":
+                fallback = shares_readme if shares_readme else cache.get(code)
+                shares_yi = get_shares_a(code, fallback=fallback)
+            else:
+                shares_yi = shares_readme if shares_readme else cache.get(code)
+            if not shares_yi or shares_yi <= 0:
+                print(f"  SKIP: 缺少股本(A股自动查失败且无缓存/手填值)", flush=True)
+                failed.append(name)
+                continue
+
+            rec = process_one((code, market, name, shares_yi))
             if rec is None:
                 print(f"  SKIP: 数据不足", flush=True)
                 failed.append(name)
                 continue
             results.append(rec)
+            cache[code] = shares_yi  # 更新缓存
             print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 均值ROE={rec['均值ROE']}%", flush=True)
         except Exception as e:
             print(f"  FAIL: {type(e).__name__}: {e}", flush=True)
@@ -228,6 +315,7 @@ def main():
             traceback.print_exc()
         time.sleep(0.4)  # 轻微限速, 避免被封
 
+    save_cache(cache)
     output = {
         "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(results),
