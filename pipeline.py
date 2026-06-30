@@ -4,9 +4,8 @@
 A 股: 新浪源 (stock_financial_abstract / stock_zh_a_daily) + 东方财富个股信息查总股本.
 港股: 东方财富财务(英文列) + 网易行情(stock_hk_daily); 股本由 README 手填(无自动接口).
 美股: 东方财富财务(英文列) + 网易行情(stock_us_daily); 股本由 README 手填.
-跨市场币种: 港股价 HKD、美股股价 USD; 财务利润按报告币种(中概股多为 CNY).
-市值与利润统一按 fx_spot_quote 当日汇率折算为人民币(亿), 保证 PE 可比.
-股本缓存 data/shares_cache.json 为 A 股自动查兜底.
+市值 = 股价 × 股本, 自然在股价币种; 利润保留原始报告币种, 不额外折算.
+PE 内部统一到价格币种计算, 确保准确.
 输出: data/valuation.json
 """
 import json
@@ -392,17 +391,22 @@ def process_one(stock, prev=None):
         return None
 
     rates = fx_rates()
-    fx_p = rates[PRICE_CCY[market]]   # 价格币种 -> CNY
-    fx_r = rates.get(profit_ccy, 1.0) # 利润币种 -> CNY
+    price_ccy = PRICE_CCY[market]
+    # 利润折算到价格币种, 用于算 PE (市值与利润同币种)
+    fx_profit_to_price = rates.get(profit_ccy, 1.0) / rates[price_ccy]
 
     roe1, roe2, roe3 = roes[0], roes[1], roes[2]
-    p1 = profits[0] * fx_r
-    p2 = profits[1] * fx_r
-    p3 = profits[2] * fx_r
+    # 利润显示: 保留原始报告币种 (来源是什么就写什么)
+    p1 = profits[0]
+    p2 = profits[1]
+    p3 = profits[2]
     mean_roe = round((roe1 + roe2 + roe3) / 3, 2)
     mean_profit = round((p1 + p2 + p3) / 3, 2)
-    market_cap = round(price * shares_yi * fx_p, 2)  # 市值(亿人民币)
-    mean_pe = round(market_cap / mean_profit, 2) if mean_profit != 0 else 0
+    # 市值: 股价 × 股本, 自然在股价币种, 不额外折算
+    market_cap = round(price * shares_yi, 2)
+    # PE: 市值与利润统一到价格币种再算
+    mean_profit_in_price = mean_profit * fx_profit_to_price
+    mean_pe = round(market_cap / mean_profit_in_price, 2) if mean_profit_in_price != 0 else 0
     valuation_ratio = round(mean_pe / mean_roe, 2) if mean_roe != 0 else 0
 
     return {
@@ -410,7 +414,7 @@ def process_one(stock, prev=None):
         "代码": code,
         "市场": market,
         "股价": round(price, 2),
-        "股本": shares_yi,
+        "股本": round(shares_yi, 2),
         "市值": market_cap,
         "ROE": round(roe1, 2),
         "ROE2": round(roe2, 2),

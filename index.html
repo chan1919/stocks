@@ -130,8 +130,8 @@
   </div>
 
   <div class="footer">
-    数据由 akshare 自动采集 · GitHub Actions 每日更新 · 港股/美股市值与利润已按当日汇率折算为人民币(亿)<br>
-    股价为各市场本币(港股 HKD / 美股 USD / A股 CNY) · 仅供学习参考, 不构成投资建议
+    数据由 akshare 自动采集 · GitHub Actions 每日更新 · 股价、市值、利润均为各市场本币<br>
+    港股:股价/市值 HKD 利润 CNY · 美股:股价/市值 USD 利润按报告币种 · 仅供学习参考, 不构成投资建议
   </div>
 </div>
 
@@ -142,15 +142,15 @@ const COLS = [
   { key: "证券简称", label: "证券简称", align: "left",  fmt: v => v },
   { key: "股价",    label: "股价",    align: "right", fmt: v => v },
   { key: "股本",    label: "股本(亿)",align: "right", fmt: v => v },
-  { key: "市值",    label: "市值(亿¥)",align: "right", fmt: v => v },
+  { key: "市值",    label: "市值(亿)",align: "right", fmt: v => v },
   { key: "ROE",     label: "ROE%",    align: "right", fmt: v => v },
   { key: "ROE2",    label: "ROE2%",   align: "right", fmt: v => v },
   { key: "ROE3",    label: "ROE3%",   align: "right", fmt: v => v },
   { key: "均值ROE", label: "均值ROE%",align: "right", fmt: v => v },
-  { key: "利润",    label: "利润(亿¥)",align: "right", fmt: v => v },
-  { key: "利润2",   label: "利润2(亿¥)",align: "right",fmt: v => v },
-  { key: "利润3",   label: "利润3(亿¥)",align: "right",fmt: v => v },
-  { key: "均值利润",label: "均值利润(亿¥)",align:"right",fmt: v=>v },
+  { key: "利润",    label: "利润(亿)",align: "right", fmt: v => v },
+  { key: "利润2",   label: "利润2(亿)",align: "right",fmt: v => v },
+  { key: "利润3",   label: "利润3(亿)",align: "right",fmt: v => v },
+  { key: "均值利润",label: "均值利润(亿)",align:"right",fmt: v=>v },
   { key: "均值PE",  label: "均值PE",  align: "right", fmt: v => v },
   { key: "估值比",  label: "估值比",  align: "right", fmt: v => v, ratio: true },
 ];
