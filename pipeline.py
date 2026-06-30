@@ -163,14 +163,22 @@ def fx_rates():
 
 
 def get_shares_a(code, fallback=None):
-    """A 股总股本(亿股): 优先 stock_individual_info_em 单只接口自动查最新值.
-    查不到时返回 fallback(README 手填或缓存值). 港股/美股无自动接口, 不调用本函数.
+    """A 股总股本(亿股), 多源兜底:
+    1) push2 实时报价 f84 (与价格同 host, GitHub 上稳定)
+    2) stock_individual_info_em (东方财富个股页, 备用)
+    3) fallback (README 手填或缓存值)
     """
+    secid = _a_secid(code)
+    s = _em_quote_shares(secid)
+    if s and s > 0:
+        return s
     try:
         df = with_retry(lambda: ak.stock_individual_info_em(symbol=code))
         row = df[df["item"] == "总股本"]
         if not row.empty:
-            return clean_number(row["value"].iloc[0]) / 1e8  # 股 -> 亿股
+            v = clean_number(row["value"].iloc[0]) / 1e8  # 股 -> 亿股
+            if v > 0:
+                return v
     except Exception:
         pass
     return fallback
@@ -198,8 +206,7 @@ def get_a_financial(code):
 
 def get_a_price(code):
     """A 股最新价: 优先东方财富实时报价, 失败回退新浪日报昨收."""
-    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
-    p = _em_quote_price(secid)
+    p = _em_quote_price(_a_secid(code))
     if p:
         return p
     prefix = "sh" if code.startswith("6") else "sz"
@@ -207,22 +214,40 @@ def get_a_price(code):
     return float(df["close"].iloc[-1])
 
 
-# ---------- 实时行情 (东方财富单只报价, 轻量带超时) ----------
-def _em_quote_price(secid, timeout=8):
-    """东方财富 push2 单只实时报价, 返回最新价或 None.
-    secid: A股 1.600519 / 0.000651; 港股 116.00700; 美股 105.AAPL(NASDAQ)/106.(NYSE)/107.(AMEX).
+# ---------- 实时行情/股本 (东方财富 push2, 轻量带超时, GitHub 可用) ----------
+def _a_secid(code):
+    """A 股 secid: 沪市 1.代码, 深市 0.代码."""
+    return f"1.{code}" if code.startswith("6") else f"0.{code}"
+
+
+def _em_quote(secid, fields="f43", timeout=8):
+    """东方财富 push2 单只报价, 返回 {字段: 值} dict 或 {}.
+    fields: f43=最新价, f84=总股本, f58=名称, f85=流通股 ...
     """
     try:
         r = requests.get(
             "https://push2.eastmoney.com/api/qt/stock/get",
-            params={"secid": secid, "fields": "f43", "fltt": "2"},
+            params={"secid": secid, "fields": fields, "fltt": "2"},
             timeout=timeout,
         )
         d = r.json().get("data") or {}
-        p = clean_number(d.get("f43"))
-        return p if p > 0 else None
+        return d
     except Exception:
-        return None
+        return {}
+
+
+def _em_quote_price(secid, timeout=8):
+    """东方财富 push2 单只实时报价, 返回最新价或 None."""
+    d = _em_quote(secid, fields="f43", timeout=timeout)
+    p = clean_number(d.get("f43"))
+    return p if p > 0 else None
+
+
+def _em_quote_shares(secid, timeout=8):
+    """东方财富 push2 查总股本, 返回亿股或 None."""
+    d = _em_quote(secid, fields="f84", timeout=timeout)
+    s = clean_number(d.get("f84"))
+    return s / 1e8 if s > 0 else None
 
 
 def _us_secid_candidates(code):
