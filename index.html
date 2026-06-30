@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>逻辑估值表</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", Roboto, sans-serif;
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+    color: #e2e8f0;
+    min-height: 100vh;
+    padding: 24px;
+  }
+  .container { max-width: 1600px; margin: 0 auto; }
+
+  header {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    flex-wrap: wrap; gap: 12px; margin-bottom: 20px;
+  }
+  h1 {
+    font-size: 28px; font-weight: 700;
+    background: linear-gradient(90deg, #34d399, #60a5fa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .meta { font-size: 13px; color: #94a3b8; }
+  .meta span { margin-left: 14px; }
+  .meta b { color: #cbd5e1; }
+
+  .legend {
+    display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px;
+    font-size: 12px; color: #94a3b8;
+  }
+  .legend .swatch {
+    display: inline-block; width: 14px; height: 14px; border-radius: 3px;
+    margin-right: 4px; vertical-align: middle;
+  }
+
+  .table-wrap {
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(148, 163, 184, 0.15);
+    border-radius: 12px; overflow: hidden;
+    backdrop-filter: blur(8px);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    position: sticky; top: 0; z-index: 10;
+    background: #1e293b; color: #cbd5e1; font-weight: 600;
+    padding: 11px 8px; text-align: right; white-space: nowrap;
+    border-bottom: 1px solid rgba(148,163,184,0.2);
+    cursor: pointer; user-select: none;
+  }
+  thead th:first-child { text-align: left; }
+  thead th:hover { color: #60a5fa; }
+  thead th.sorted { color: #34d399; }
+  thead th .arrow { font-size: 10px; margin-left: 2px; }
+
+  tbody td {
+    padding: 10px 8px; text-align: right; white-space: nowrap;
+    border-bottom: 1px solid rgba(148,163,184,0.06);
+    transition: background 0.15s;
+  }
+  tbody td:first-child { text-align: left; font-weight: 600; color: #f1f5f9; }
+  tbody tr:hover td { background: rgba(96, 165, 250, 0.08); }
+
+  /* 估值比单元格颜色 — 由 JS 内联设置 */
+  td.ratio { font-weight: 700; font-size: 14px; }
+  .name-cell { display: flex; align-items: center; gap: 6px; }
+  .market-tag {
+    font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600;
+  }
+  .tag-A { background: #1e3a8a; color: #93c5fd; }
+  .tag-HK { background: #7f1d1d; color: #fca5a5; }
+  .tag-US { background: #4c1d95; color: #c4b5fd; }
+
+  .loading {
+    text-align: center; padding: 60px; color: #64748b; font-size: 15px;
+  }
+  .loading .spin {
+    display: inline-block; width: 28px; height: 28px;
+    border: 3px solid rgba(148,163,184,0.2); border-top-color: #34d399;
+    border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 10px;
+    vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  tbody tr { animation: fadeIn 0.4s ease both; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
+
+  .footer { margin-top: 18px; font-size: 11px; color: #64748b; text-align: center; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>逻辑估值表</h1>
+    <div class="meta">
+      <span>更新时间: <b id="updateTime">—</b></span>
+      <span>共 <b id="count">—</b> 只</span>
+      <span>失败 <b id="failed">—</b></span>
+    </div>
+  </header>
+
+  <div class="legend">
+    <span><i class="swatch" style="background:#006400"></i>深绿(极度低估 &lt;0.3)</span>
+    <span><i class="swatch" style="background:#228b22"></i>低估(0.3-0.6)</span>
+    <span><i class="swatch" style="background:#3a3a3a"></i>中性(0.6-1.0)</span>
+    <span><i class="swatch" style="background:#cc5500"></i>偏高(1.0-1.5)</span>
+    <span><i class="swatch" style="background:#cc0000"></i>高估(1.5-2.0)</span>
+    <span><i class="swatch" style="background:#660000"></i>严重高估(&ge;2.0)</span>
+  </div>
+
+  <div class="table-wrap">
+    <table id="table">
+      <thead>
+        <tr id="thead"></tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="15" class="loading"><span class="spin"></span>正在加载数据…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">数据由 akshare 自动采集 · GitHub Actions 每日更新 · 估值比 = 均值PE / 均值ROE · 仅供学习参考, 不构成投资建议</div>
+</div>
+
+<script>
+const COLS = [
+  { key: "证券简称", label: "证券简称", align: "left",  fmt: v => v },
+  { key: "股价",    label: "股价",    align: "right", fmt: v => v },
+  { key: "股本",    label: "股本(亿)",align: "right", fmt: v => v },
+  { key: "市值",    label: "市值(亿)",align: "right", fmt: v => v },
+  { key: "ROE",     label: "ROE%",    align: "right", fmt: v => v },
+  { key: "ROE2",    label: "ROE2%",   align: "right", fmt: v => v },
+  { key: "ROE3",    label: "ROE3%",   align: "right", fmt: v => v },
+  { key: "均值ROE", label: "均值ROE%",align: "right", fmt: v => v },
+  { key: "利润",    label: "利润(亿)",align: "right", fmt: v => v },
+  { key: "利润2",   label: "利润2(亿)",align: "right",fmt: v => v },
+  { key: "利润3",   label: "利润3(亿)",align: "right",fmt: v => v },
+  { key: "均值利润",label: "均值利润(亿)",align:"right",fmt: v=>v },
+  { key: "均值PE",  label: "均值PE",  align: "right", fmt: v => v },
+  { key: "估值比",  label: "估值比",  align: "right", fmt: v => v, ratio: true },
+];
+
+// 估值比颜色: <0.6 绿(越低越深), 0.6-1.0 中性深灰, >=1.0 红(越高越深)
+function ratioColor(r) {
+  if (r == null || isNaN(r)) return { bg: "#1e293b", fg: "#94a3b8" };
+  if (r < 0.6) {
+    // 0 -> 极深绿, 0.6 -> 浅绿(约 #3a5a3a)
+    const t = Math.min((0.6 - r) / 0.6, 1);          // 0..1
+    const L = 38 - t * 30;                            // 38% -> 8%
+    return { bg: `hsl(140, 65%, ${L}%)`, fg: L < 24 ? "#fff" : "#dcfce7" };
+  } else if (r < 1.0) {
+    const t = (1.0 - r) / 0.4;                        // 0..1, 越接近1越偏暖
+    const L = 22 + t * 8;
+    return { bg: `hsl(${30 * t}, 20%, ${L}%)`, fg: "#cbd5e1" };
+  } else {
+    // 1.0 -> 浅红, 2.0+ -> 深红
+    const t = Math.min((r - 1.0) / 1.0, 1);           // 0..1
+    const L = 38 - t * 32;                            // 38% -> 6%
+    return { bg: `hsl(0, 75%, ${L}%)`, fg: L < 22 ? "#fff" : "#fecaca" };
+  }
+}
+
+let DATA = [];
+let sortKey = "估值比";
+let sortAsc = true;
+
+function renderHead() {
+  const tr = document.getElementById("thead");
+  tr.innerHTML = COLS.map(c => {
+    const cls = c.key === sortKey ? "sorted" : "";
+    const arrow = c.key === sortKey ? (sortAsc ? "▲" : "▼") : "";
+    return `<th class="${cls}" data-key="${c.key}">${c.label}<span class="arrow">${arrow}</span></th>`;
+  }).join("");
+  tr.querySelectorAll("th").forEach(th => {
+    th.onclick = () => {
+      const k = th.dataset.key;
+      if (k === sortKey) sortAsc = !sortAsc; else { sortKey = k; sortAsc = true; }
+      renderHead(); renderBody();
+    };
+  });
+}
+
+function renderBody() {
+  const tb = document.getElementById("tbody");
+  if (!DATA.length) {
+    tb.innerHTML = `<tr><td colspan="${COLS.length}" class="loading">暂无数据</td></tr>`;
+    return;
+  }
+  const rows = [...DATA].sort((a, b) => {
+    const x = a[sortKey], y = b[sortKey];
+    if (typeof x === "string") return sortAsc ? x.localeCompare(y, "zh") : y.localeCompare(x, "zh");
+    return sortAsc ? (x - y) : (y - x);
+  });
+  tb.innerHTML = rows.map((r, i) => {
+    const tds = COLS.map(c => {
+      const val = r[c.key];
+      if (c.key === "证券简称") {
+        const tag = `<span class="market-tag tag-${r["市场"]}">${r["市场"]}</span>`;
+        return `<td><div class="name-cell">${tag}${val}</div></td>`;
+      }
+      if (c.ratio) {
+        const col = ratioColor(val);
+        return `<td class="ratio" style="background:${col.bg};color:${col.fg}">${val}</td>`;
+      }
+      return `<td>${c.fmt(val)}</td>`;
+    }).join("");
+    return `<tr style="animation-delay:${i * 0.02}s">${tds}</tr>`;
+  }).join("");
+}
+
+function renderMeta(meta) {
+  document.getElementById("updateTime").textContent = meta.update_time || "—";
+  document.getElementById("count").textContent = meta.count ?? "—";
+  document.getElementById("failed").textContent = (meta.failed && meta.failed.length) ? meta.failed.length : 0;
+}
+
+async function load() {
+  try {
+    const res = await fetch("data/valuation.json?_=" + Date.now());
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const json = await res.json();
+    DATA = json.data || [];
+    renderMeta(json);
+    renderHead();
+    renderBody();
+  } catch (e) {
+    document.getElementById("tbody").innerHTML =
+      `<tr><td colspan="${COLS.length}" class="loading">加载失败: ${e.message}<br><span style="font-size:12px;color:#64748b">请先运行 pipeline.py 生成 data/valuation.json</span></td></tr>`;
+  }
+}
+
+load();
+</script>
+</body>
+</html>
