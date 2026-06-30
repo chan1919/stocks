@@ -13,7 +13,7 @@ import json
 import os
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import threading
 
 import akshare as ak
@@ -21,8 +21,20 @@ import pandas as pd
 import requests
 
 
+CN_TZ = timezone(timedelta(hours=8))
+AK_TIMEOUT = 30
+REQUEST_TIMEOUT = 8
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/",
+}
+HTTP = requests.Session()
+HTTP.headers.update(HTTP_HEADERS)
+
+
 # ---------- 超时包装: akshare 接口无原生 timeout, 用线程硬卡 ----------
-def timed(fn, secs=60):
+def timed(fn, secs=AK_TIMEOUT):
     """运行 fn, 最多 secs 秒, 超时抛 TimeoutError. 防接口卡死拖垮整个 pipeline."""
     box = {}
     def run():
@@ -127,7 +139,7 @@ def pick_annual_cols(cols, n=3):
     return annual
 
 
-def with_retry(fn, attempts=3, delay=1.5, secs=60):
+def with_retry(fn, attempts=2, delay=1.0, secs=AK_TIMEOUT):
     """重试 + 超时, 应对接口偶发超时/卡死. secs 控制单次最长耗时."""
     last = None
     for _ in range(attempts):
@@ -162,12 +174,45 @@ def fx_rates():
     return rates
 
 
+# ---------- A 股行情快照: 一次拉全市场, 避免逐只请求被限流 ----------
+_A_SPOT = None
+def a_spot_map():
+    """返回 {code: {price, shares_yi, market_cap_yi}}.
+    东方财富 A 股全市场快照含最新价与总市值; 股本 = 总市值 / 最新价。
+    失败时返回空 dict, 后续会用逐只接口/缓存兜底。
+    """
+    global _A_SPOT
+    if _A_SPOT is not None:
+        return _A_SPOT
+    out = {}
+    try:
+        df = with_retry(lambda: ak.stock_zh_a_spot_em(), attempts=1, secs=45)
+        for _, row in df.iterrows():
+            code = str(row.get("代码", "")).zfill(6)
+            price = clean_number(row.get("最新价"))
+            market_cap_yuan = clean_number(row.get("总市值"))
+            if code and price > 0 and market_cap_yuan > 0:
+                out[code] = {
+                    "price": price,
+                    "shares_yi": market_cap_yuan / price / 1e8,
+                    "market_cap_yi": market_cap_yuan / 1e8,
+                }
+    except Exception as e:
+        print(f"A股快照不可用, 将走逐只/缓存兜底: {type(e).__name__}: {e}", flush=True)
+    _A_SPOT = out
+    return out
+
+
 def get_shares_a(code, fallback=None):
     """A 股总股本(亿股), 多源兜底:
-    1) push2 实时报价 f84 (与价格同 host, GitHub 上稳定)
-    2) stock_individual_info_em (东方财富个股页, 备用)
-    3) fallback (README 手填或缓存值)
+    1) A 股全市场快照 (总市值/最新价, 避免逐只限流)
+    2) push2 实时报价 f84
+    3) stock_individual_info_em
+    4) fallback (README 手填或缓存值)
     """
+    spot = a_spot_map().get(code)
+    if spot and spot.get("shares_yi", 0) > 0:
+        return spot["shares_yi"]
     secid = _a_secid(code)
     s = _em_quote_shares(secid)
     if s and s > 0:
@@ -206,6 +251,9 @@ def get_a_financial(code):
 
 def get_a_price(code):
     """A 股最新价: 优先东方财富实时报价, 失败回退新浪日报昨收."""
+    spot = a_spot_map().get(code)
+    if spot and spot.get("price", 0) > 0:
+        return spot["price"]
     p = _em_quote_price(_a_secid(code))
     if p:
         return p
@@ -220,12 +268,12 @@ def _a_secid(code):
     return f"1.{code}" if code.startswith("6") else f"0.{code}"
 
 
-def _em_quote(secid, fields="f43", timeout=8):
+def _em_quote(secid, fields="f43", timeout=REQUEST_TIMEOUT):
     """东方财富 push2 单只报价, 返回 {字段: 值} dict 或 {}.
     fields: f43=最新价, f84=总股本, f58=名称, f85=流通股 ...
     """
     try:
-        r = requests.get(
+        r = HTTP.get(
             "https://push2.eastmoney.com/api/qt/stock/get",
             params={"secid": secid, "fields": fields, "fltt": "2"},
             timeout=timeout,
@@ -436,7 +484,8 @@ def main():
 
     save_cache(cache)
     output = {
-        "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "update_time": datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "total": len(stocks),
         "count": len(results),
         "failed": failed,
         "data": results,

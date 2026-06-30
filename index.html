@@ -230,7 +230,7 @@ function renderBody() {
 
 function renderMeta(meta) {
   document.getElementById("updateTime").textContent = meta.update_time || "—";
-  document.getElementById("count").textContent = meta.count ?? "—";
+  document.getElementById("count").textContent = meta.total ?? meta.count ?? "—";
   document.getElementById("failed").textContent = (meta.failed && meta.failed.length) ? meta.failed.length : 0;
 }
 
