@@ -14,9 +14,30 @@ import os
 import time
 import traceback
 from datetime import datetime
+import threading
 
 import akshare as ak
 import pandas as pd
+import requests
+
+
+# ---------- 超时包装: akshare 接口无原生 timeout, 用线程硬卡 ----------
+def timed(fn, secs=60):
+    """运行 fn, 最多 secs 秒, 超时抛 TimeoutError. 防接口卡死拖垮整个 pipeline."""
+    box = {}
+    def run():
+        try:
+            box["ok"] = fn()
+        except Exception as e:
+            box["err"] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(secs)
+    if t.is_alive():
+        raise TimeoutError(f">{secs}s")
+    if "err" in box:
+        raise box["err"]
+    return box.get("ok")
 
 
 # ---------- 股票池解析 (README 驱动) ----------
@@ -44,6 +65,7 @@ def parse_readme(path=README_PATH):
                 continue
             if market is None:
                 continue  # 说明区(标题/表格/列表/分割线)跳过
+            s = s.lstrip("-*").strip()  # 去除列表前缀
             parts = s.split()
             if len(parts) < 2:
                 continue
@@ -105,12 +127,12 @@ def pick_annual_cols(cols, n=3):
     return annual
 
 
-def with_retry(fn, attempts=3, delay=1.5):
-    """简单重试, 应对东方财富/网易接口偶发超时."""
+def with_retry(fn, attempts=3, delay=1.5, secs=60):
+    """重试 + 超时, 应对接口偶发超时/卡死. secs 控制单次最长耗时."""
     last = None
     for _ in range(attempts):
         try:
-            return fn()
+            return timed(fn, secs)
         except Exception as e:
             last = e
             time.sleep(delay)
@@ -160,7 +182,7 @@ def get_a_financial(code):
     stock_financial_abstract 返回: 行=指标(含重复), 列=日期字符串.
     iloc[0] = 归母净利润, iloc[11] = 净资产收益率(ROE).
     """
-    df = ak.stock_financial_abstract(symbol=code)
+    df = with_retry(lambda: ak.stock_financial_abstract(symbol=code))
     idx_list = df["指标"].tolist()
     r_gm = find_first_row_index(idx_list, ["归母净利润"])
     r_roe = find_first_row_index(idx_list, ["净资产收益率(ROE)", "净资产收益率"])
@@ -175,15 +197,45 @@ def get_a_financial(code):
 
 
 def get_a_price(code):
-    """A 股最新真实收盘价(不复权)."""
+    """A 股最新价: 优先东方财富实时报价, 失败回退新浪日报昨收."""
+    secid = f"1.{code}" if code.startswith("6") else f"0.{code}"
+    p = _em_quote_price(secid)
+    if p:
+        return p
     prefix = "sh" if code.startswith("6") else "sz"
-    df = ak.stock_zh_a_daily(symbol=prefix + code, adjust="")
+    df = with_retry(lambda: ak.stock_zh_a_daily(symbol=prefix + code, adjust=""))
     return float(df["close"].iloc[-1])
 
 
+# ---------- 实时行情 (东方财富单只报价, 轻量带超时) ----------
+def _em_quote_price(secid, timeout=8):
+    """东方财富 push2 单只实时报价, 返回最新价或 None.
+    secid: A股 1.600519 / 0.000651; 港股 116.00700; 美股 105.AAPL(NASDAQ)/106.(NYSE)/107.(AMEX).
+    """
+    try:
+        r = requests.get(
+            "https://push2.eastmoney.com/api/qt/stock/get",
+            params={"secid": secid, "fields": "f43", "fltt": "2"},
+            timeout=timeout,
+        )
+        d = r.json().get("data") or {}
+        p = clean_number(d.get("f43"))
+        return p if p > 0 else None
+    except Exception:
+        return None
+
+
+def _us_secid_candidates(code):
+    """美股 secid 候选: 105 NASDAQ, 106 NYSE, 107 AMEX."""
+    return [f"105.{code}", f"106.{code}", f"107.{code}"]
+
+
 # ---------- 港股 ----------
-def get_hk_price(code):
-    """港股最新收盘价(网易源, 本地与 Actions 均可用)."""
+def get_hk_price(code, name=None):
+    """港股最新价: 优先东方财富实时报价, 失败回退网易日报昨收."""
+    p = _em_quote_price(f"116.{code}")
+    if p:
+        return p
     df = with_retry(lambda: ak.stock_hk_daily(symbol=code, adjust=""))
     return float(df["close"].iloc[-1])
 
@@ -203,8 +255,12 @@ def get_hk_financial(code):
 
 
 # ---------- 美股 ----------
-def get_us_price(code):
-    """美股最新收盘价(网易源, symbol 直接用代码如 AAPL/NVDA/PDD)."""
+def get_us_price(code, name=None):
+    """美股最新价: 优先东方财富实时报价(尝试 NASDAQ/NYSE/AMEX), 失败回退网易日报昨收."""
+    for secid in _us_secid_candidates(code):
+        p = _em_quote_price(secid)
+        if p:
+            return p
     df = with_retry(lambda: ak.stock_us_daily(symbol=code, adjust=""))
     return float(df["close"].iloc[-1])
 
@@ -228,20 +284,36 @@ def get_us_financial(code):
 # ---------- 主流程 ----------
 PRICE_CCY = {"A": "CNY", "HK": "HKD", "US": "USD"}
 
-def process_one(stock):
+def process_one(stock, prev=None):
     code, market, name, shares_yi = stock
     roes, profits, price = [], [], 0.0
-    profit_ccy = "CNY"  # 港股红筹/H 股多以人民币列报, A 股为 CNY
+    profit_ccy = "CNY"
 
-    if market == "A":
-        roes, profits = get_a_financial(code)
-        price = get_a_price(code)
-    elif market == "HK":
-        roes, profits = get_hk_financial(code)
-        price = get_hk_price(code)
-    elif market == "US":
-        roes, profits, profit_ccy = get_us_financial(code)
-        price = get_us_price(code)
+    try:
+        if market == "A":
+            roes, profits = get_a_financial(code)
+            price = get_a_price(code)
+        elif market == "HK":
+            roes, profits = get_hk_financial(code)
+            price = get_hk_price(code, name)
+        elif market == "US":
+            roes, profits, profit_ccy = get_us_financial(code)
+            price = get_us_price(code, name)
+    except Exception as e:
+        # 网络全挂时回退旧记录保底(宁可旧数据也不丢股票)
+        if prev:
+            print(f"  NET FAIL, 用上次数据保底: {type(e).__name__}", flush=True)
+            return prev
+        raise
+
+    # 价格拿不到 -> 用旧价格保底
+    if price <= 0 and prev and prev.get("股价", 0) > 0:
+        print(f"  价格缺失, 用上次股价 {prev['股价']} 保底", flush=True)
+        price = prev["股价"]
+    # 财务拿不到 -> 用旧 ROE/利润保底
+    if (len(roes) < 3 or len(profits) < 3) and prev and prev.get("均值ROE", 0) > 0:
+        print(f"  财务缺失, 用上次财务保底", flush=True)
+        return prev
 
     if len(roes) < 3 or len(profits) < 3 or price <= 0:
         return None
@@ -262,6 +334,7 @@ def process_one(stock):
 
     return {
         "证券简称": name,
+        "代码": code,
         "市场": market,
         "股价": round(price, 2),
         "股本": shares_yi,
@@ -279,12 +352,27 @@ def process_one(stock):
     }
 
 
+def load_prev(path="data/valuation.json"):
+    """读取上次 valuation.json, 返回 (by_code, by_name) 两个 dict 供保底."""
+    if not os.path.exists(path):
+        return {}, {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f).get("data") or []
+        by_code = {r["代码"]: r for r in data if "代码" in r}
+        by_name = {r["证券简称"]: r for r in data}
+        return by_code, by_name
+    except Exception:
+        return {}, {}
+
+
 def main():
     stocks = parse_readme()
     if not stocks:
         print("README.md 未解析到任何股票, 请检查股票池格式.", flush=True)
         return
     cache = load_cache()
+    prev_code, prev_name = load_prev()
     results = []
     failed = []
     for i, (code, market, name, shares_readme) in enumerate(stocks, 1):
@@ -301,10 +389,16 @@ def main():
                 failed.append(name)
                 continue
 
-            rec = process_one((code, market, name, shares_yi))
+            prev = prev_code.get(code) or prev_name.get(name)
+            rec = process_one((code, market, name, shares_yi), prev)
             if rec is None:
-                print(f"  SKIP: 数据不足", flush=True)
-                failed.append(name)
+                # 最后兜底: 直接用上次记录
+                if prev:
+                    print(f"  SKIP: 数据不足, 用上次数据保底", flush=True)
+                    results.append(prev)
+                else:
+                    print(f"  SKIP: 数据不足且无历史数据", flush=True)
+                    failed.append(name)
                 continue
             results.append(rec)
             cache[code] = shares_yi  # 更新缓存
