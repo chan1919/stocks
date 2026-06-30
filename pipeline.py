@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """估值表数据采集与计算管道.
 A 股: 新浪源 (stock_financial_abstract / stock_zh_a_daily) - 本地可用, 已验证.
-港股/美股: 东方财富源 - 本地可能被封, GitHub Actions 上正常.
+港股: 东方财富财务(英文列) + 网易行情(stock_hk_daily) - 本地与 Actions 均可用.
+美股: 东方财富财务(英文列) + 网易行情(stock_us_daily) - 本地与 Actions 均可用.
+跨市场币种: 港股价 HKD、美股股价 USD; 财务利润按报告币种(中概股多为 CNY).
+市值与利润统一按 fx_spot_quote 当日汇率折算为人民币(亿), 保证 PE 可比.
 输出: data/valuation.json
 """
 import json
@@ -45,6 +48,41 @@ def pick_annual_cols(cols, n=3):
     return annual
 
 
+def with_retry(fn, attempts=3, delay=1.5):
+    """简单重试, 应对东方财富/网易接口偶发超时."""
+    last = None
+    for _ in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            time.sleep(delay)
+    raise last
+
+
+# 汇率缓存: 各货币 -> 人民币 (CNY)
+_FX = None
+def fx_rates():
+    """返回 {货币: 折算CNY汇率}, 失败时用近似硬编码值兜底."""
+    global _FX
+    if _FX is not None:
+        return _FX
+    rates = {"CNY": 1.0, "USD": 7.10, "HKD": 0.87}
+    try:
+        df = with_retry(lambda: ak.fx_spot_quote())
+        for row in df.itertuples(index=False):
+            pair, bid, ask = str(row[0]), float(row[1]), float(row[2])
+            mid = (bid + ask) / 2.0
+            if pair == "USD/CNY":
+                rates["USD"] = mid
+            elif pair == "HKD/CNY":
+                rates["HKD"] = mid
+    except Exception:
+        pass
+    _FX = rates
+    return rates
+
+
 # ---------- A 股 ----------
 def get_a_financial(code):
     """A 股近 3 年年报归母净利润(亿元)与 ROE(%).
@@ -74,83 +112,55 @@ def get_a_price(code):
 
 # ---------- 港股 ----------
 def get_hk_price(code):
-    df = ak.stock_hk_hist(symbol=code, period="daily", adjust="")
-    close_col = "收盘" if "收盘" in df.columns else "close"
-    return float(df[close_col].iloc[-1])
+    """港股最新收盘价(网易源, 本地与 Actions 均可用)."""
+    df = with_retry(lambda: ak.stock_hk_daily(symbol=code, adjust=""))
+    return float(df["close"].iloc[-1])
 
 
 def get_hk_financial(code):
-    """港股近 3 年年报归母净利润与 ROE. 列名自适应."""
-    df = ak.stock_financial_hk_analysis_indicator_em(symbol=code, indicator="年度")
-    # 自适应: 找日期列与指标列
-    # 可能结构: 行=年份, 列=指标名
-    profit_cols = ["归母净利润", "归属母公司净利润", "净利润", "归属母公司股东净利润"]
-    roe_cols = ["净资产收益率", "净资产收益率(ROE)", "ROE", "加权净资产收益率"]
-    date_col = None
-    for c in df.columns:
-        if any(k in str(c) for k in ["日期", "报告期", "年份", "date", "year", "DATE", "YEAR"]):
-            date_col = c
-            break
-    if date_col is None and df.index.name and any(k in str(df.index.name) for k in ["日期", "报告期", "年份", "date", "year"]):
-        df = df.reset_index()
-        date_col = df.columns[0]
-    if date_col is None:
-        # 退而求其次: 取 object 类型第一列
-        for c in df.columns:
-            if df[c].dtype == object:
-                date_col = c
-                break
-    if date_col is None:
+    """港股近 3 年年报归母净利润(亿元)与 ROE(%).
+    东方财富接口返回英文列: REPORT_DATE / HOLDER_PROFIT / ROE_AVG.
+    """
+    df = with_retry(lambda: ak.stock_financial_hk_analysis_indicator_em(symbol=code, indicator="年度"))
+    date_col, profit_col, roe_col = "REPORT_DATE", "HOLDER_PROFIT", "ROE_AVG"
+    if not all(c in df.columns for c in (date_col, profit_col, roe_col)):
         return [], []
     df = df.sort_values(date_col, ascending=False).head(3)
-    pcol = next((c for c in profit_cols if c in df.columns), None)
-    rcol = next((c for c in roe_cols if c in df.columns), None)
-    if pcol is None or rcol is None:
-        return [], []
-    profits = [clean_number(v) / 1e8 for v in df[pcol].values]  # 假设单位为元
-    roes = [clean_number(v) for v in df[rcol].values]
+    profits = [clean_number(v) / 1e8 for v in df[profit_col].values]  # 元 -> 亿元
+    roes = [clean_number(v) for v in df[roe_col].values]
     return roes, profits
 
 
 # ---------- 美股 ----------
 def get_us_price(code):
-    sym = "105." + code  # 105 = NASDAQ 前缀; AAPL/NVDA/PDD 均在 NASDAQ
-    df = ak.stock_us_hist(symbol=sym, period="daily", adjust="")
-    close_col = "收盘" if "收盘" in df.columns else "close"
-    return float(df[close_col].iloc[-1])
+    """美股最新收盘价(网易源, symbol 直接用代码如 AAPL/NVDA/PDD)."""
+    df = with_retry(lambda: ak.stock_us_daily(symbol=code, adjust=""))
+    return float(df["close"].iloc[-1])
 
 
 def get_us_financial(code):
-    """美股近 3 年年报归母净利润与 ROE. 列名自适应."""
-    df = ak.stock_financial_us_analysis_indicator_em(symbol=code)
-    profit_cols = ["归母净利润", "归属母公司净利润", "净利润", "归属母公司股东净利润"]
-    roe_cols = ["净资产收益率", "净资产收益率(ROE)", "ROE", "加权净资产收益率"]
-    date_col = None
-    for c in df.columns:
-        if any(k in str(c) for k in ["日期", "报告期", "年份", "date", "year", "DATE", "YEAR"]):
-            date_col = c
-            break
-    if date_col is None:
-        for c in df.columns:
-            if df[c].dtype == object:
-                date_col = c
-                break
-    if date_col is None:
-        return [], []
+    """美股近 3 年年报归母净利润(亿元)与 ROE(%), 并返回报告币种.
+    东方财富接口返回英文列: REPORT_DATE / PARENT_HOLDER_NETPROFIT / ROE_AVG / CURRENCY_ABBR.
+    中概股(如 PDD)报告币种为 CNY, 美股本土(如 AAPL)为 USD.
+    """
+    df = with_retry(lambda: ak.stock_financial_us_analysis_indicator_em(symbol=code))
+    date_col, profit_col, roe_col, ccy_col = "REPORT_DATE", "PARENT_HOLDER_NETPROFIT", "ROE_AVG", "CURRENCY_ABBR"
+    if not all(c in df.columns for c in (date_col, profit_col, roe_col)):
+        return [], [], "USD"
     df = df.sort_values(date_col, ascending=False).head(3)
-    pcol = next((c for c in profit_cols if c in df.columns), None)
-    rcol = next((c for c in roe_cols if c in df.columns), None)
-    if pcol is None or rcol is None:
-        return [], []
-    profits = [clean_number(v) / 1e8 for v in df[pcol].values]
-    roes = [clean_number(v) for v in df[rcol].values]
-    return roes, profits
+    profits = [clean_number(v) / 1e8 for v in df[profit_col].values]  # 元 -> 亿元(报告币种)
+    roes = [clean_number(v) for v in df[roe_col].values]
+    ccy = str(df[ccy_col].iloc[0]).strip().upper() if ccy_col in df.columns and len(df) else "USD"
+    return roes, profits, ccy
 
 
 # ---------- 主流程 ----------
+PRICE_CCY = {"A": "CNY", "HK": "HKD", "US": "USD"}
+
 def process_one(stock):
     code, market, name, shares_yi = stock
     roes, profits, price = [], [], 0.0
+    profit_ccy = "CNY"  # 港股红筹/H 股多以人民币列报, A 股为 CNY
 
     if market == "A":
         roes, profits = get_a_financial(code)
@@ -159,17 +169,23 @@ def process_one(stock):
         roes, profits = get_hk_financial(code)
         price = get_hk_price(code)
     elif market == "US":
-        roes, profits = get_us_financial(code)
+        roes, profits, profit_ccy = get_us_financial(code)
         price = get_us_price(code)
 
     if len(roes) < 3 or len(profits) < 3 or price <= 0:
         return None
 
+    rates = fx_rates()
+    fx_p = rates[PRICE_CCY[market]]   # 价格币种 -> CNY
+    fx_r = rates.get(profit_ccy, 1.0) # 利润币种 -> CNY
+
     roe1, roe2, roe3 = roes[0], roes[1], roes[2]
-    p1, p2, p3 = profits[0], profits[1], profits[2]
+    p1 = profits[0] * fx_r
+    p2 = profits[1] * fx_r
+    p3 = profits[2] * fx_r
     mean_roe = round((roe1 + roe2 + roe3) / 3, 2)
     mean_profit = round((p1 + p2 + p3) / 3, 2)
-    market_cap = round(price * shares_yi, 2)  # 价格 × 总股本(亿股) = 市值(亿元)
+    market_cap = round(price * shares_yi * fx_p, 2)  # 市值(亿人民币)
     mean_pe = round(market_cap / mean_profit, 2) if mean_profit != 0 else 0
     valuation_ratio = round(mean_pe / mean_roe, 2) if mean_roe != 0 else 0
 
