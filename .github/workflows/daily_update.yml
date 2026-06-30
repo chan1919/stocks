@@ -5,7 +5,7 @@ on:
     - cron: '30 14 * * 1-5'   # 周一至周五 北京时间 22:30 (UTC 14:30), 收盘后运行
   push:
     branches: [main]
-    paths: ['README.md', '.github/workflows/daily_update.yml']  # 改股票池或本配置立即触发; data/ 自动提交不触发, 无死循环
+    paths: ['README.md', 'pipeline.py', '.github/workflows/daily_update.yml']  # 股票池/代码/配置改动即触发; data/ 自动提交不触发, 无死循环
   workflow_dispatch:           # 允许手动触发
 
 permissions:
