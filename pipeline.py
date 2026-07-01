@@ -62,8 +62,10 @@ SECTION_MARKET = {"a股": "A", "港股": "HK", "美股": "US"}
 def parse_readme(path=README_PATH):
     """解析 README.md 的股票池, 返回 [(code, market, name, shares_opt), ...].
     每行格式: `代码 中文名 [股本]`, 股本可省略(亿股). 按 ## 分组识别市场.
+    同一代码重复出现时保留首次 (避免 README 手误重复行导致 results 双行).
     """
     stocks = []
+    seen = set()
     market = None
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -81,6 +83,9 @@ def parse_readme(path=README_PATH):
             if len(parts) < 2:
                 continue
             code, name = parts[0], parts[1]
+            if code in seen:
+                continue  # 去重: 同代码只保留首次
+            seen.add(code)
             shares = None
             if len(parts) >= 3:
                 try:
@@ -110,14 +115,23 @@ def save_cache(cache, path=CACHE_PATH):
 
 # ---------- 工具函数 ----------
 def clean_number(val):
-    """清洗数值: 去百分号/逗号, 转 float."""
+    """清洗数值: 去百分号/逗号, 转 float.
+    支持中文量词后缀: '1.47亿' -> 147000000, '2.16万' -> 21600 (ths 源净利润列格式).
+    """
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
     s = str(val).strip().replace("%", "").replace(",", "")
+    mult = 1.0
+    if s and s[-1] in "亿万":
+        unit = s[-1]
+        s = s[:-1]
+        mult = 1e8 if unit == "亿" else 1e4
+    if s in ("False", "True", "--", "", "nan", "NaN"):
+        return 0.0
     try:
-        return float(s)
+        return float(s) * mult
     except ValueError:
         return 0.0
 
@@ -163,6 +177,8 @@ def fx_rates():
         for row in df.itertuples(index=False):
             pair, bid, ask = str(row[0]), float(row[1]), float(row[2])
             mid = (bid + ask) / 2.0
+            if mid != mid:  # nan 检查: nan != nan 为 True, 跳过脏数据保硬编码值
+                continue
             if pair == "USD/CNY":
                 rates["USD"] = mid
             elif pair == "HKD/CNY":
@@ -229,10 +245,11 @@ def get_shares_a(code, fallback=None):
 
 
 # ---------- A 股 ----------
-def get_a_financial(code):
-    """A 股近 3 年年报归母净利润(亿元)与 ROE(%).
+def _get_a_financial_sina(code):
+    """A 股近 3 年年报归母净利润(亿元)与 ROE(%) - 新浪源 (主源).
     stock_financial_abstract 返回: 行=指标(含重复), 列=日期字符串.
     iloc[0] = 归母净利润, iloc[11] = 净资产收益率(ROE).
+    返回 (roes, profits) 或 ([], []) 表示取数失败.
     """
     df = with_retry(lambda: ak.stock_financial_abstract(symbol=code))
     idx_list = df["指标"].tolist()
@@ -246,6 +263,56 @@ def get_a_financial(code):
     profits = [clean_number(df.iloc[r_gm][c]) / 1e8 for c in annual_cols]  # 元 -> 亿元
     roes = [clean_number(df.iloc[r_roe][c]) for c in annual_cols]
     return roes, profits
+
+
+def _get_a_financial_em(code):
+    """A 股近 3 年年报归母净利润(亿元)与 ROE(%) - 东方财富 datacenter (兜底).
+    直接 HTTP 请求 datacenter 接口, 不依赖 akshare wrapper (规避 *_by_yearly_em 的 hidctype bug).
+    字段: REPORTDATE / WEIGHTAVG_ROE(加权ROE%) / PARENT_NETPROFIT(归母净利,元).
+    SECUCODE: 沪市 6开头.SH, 深市 .SZ.
+    返回 (roes, profits) 或 ([], []) 表示取数失败.
+    """
+    secucode = code + ".SH" if code.startswith("6") else code + ".SZ"
+    try:
+        r = HTTP.get(
+            "https://datacenter.eastmoney.com/securities/api/data/v1/get",
+            params={
+                "reportName": "RPT_LICO_FN_CPD",
+                "columns": "REPORTDATE,WEIGHTAVG_ROE,PARENT_NETPROFIT",
+                "filter": '(SECUCODE="%s")' % secucode,
+                "pageNumber": 1, "pageSize": 50,
+                "sortColumns": "REPORTDATE", "sortTypes": "-1",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        rows = (r.json().get("result") or {}).get("data") or []
+    except Exception:
+        return [], []
+    # 筛年报(12-31), 已按 REPORTDATE 降序, 取最近 3 年
+    annual = [x for x in rows if str(x.get("REPORTDATE", "")).endswith("12-31")][:3]
+    if len(annual) < 3:
+        return [], []
+    roes = [clean_number(x.get("WEIGHTAVG_ROE")) for x in annual]
+    profits = [clean_number(x.get("PARENT_NETPROFIT")) / 1e8 for x in annual]  # 元 -> 亿元
+    return roes, profits
+
+
+def get_a_financial(code):
+    """A 股近 3 年年报净利润(亿元)与 ROE(%), 双源: 新浪 -> 东方财富兜底."""
+    try:
+        roes, profits = _get_a_financial_sina(code)
+        if len(roes) >= 3 and len(profits) >= 3:
+            return roes, profits
+    except Exception as e:
+        print(f"  新浪财务失败({type(e).__name__}), 转东方财富兜底", flush=True)
+    try:
+        roes, profits = _get_a_financial_em(code)
+        if len(roes) >= 3 and len(profits) >= 3:
+            print(f"  东方财富兜底成功", flush=True)
+            return roes, profits
+    except Exception as e:
+        print(f"  东方财富兜底也失败({type(e).__name__})", flush=True)
+    return [], []
 
 
 def get_a_price(code):
@@ -355,40 +422,118 @@ def get_us_financial(code):
 
 # ---------- 主流程 ----------
 PRICE_CCY = {"A": "CNY", "HK": "HKD", "US": "USD"}
+FIN_CACHE_PATH = "data/financials.json"
+FIN_REFRESH_DAYS = 30  # 财务缓存超过 30 天才重新拉新鲜, 否则直接用缓存
 
-def process_one(stock, prev=None):
-    code, market, name, shares_yi = stock
-    roes, profits, price = [], [], 0.0
-    profit_ccy = "CNY"
 
+def _parse_iso_dt(s):
+    """解析 ISO 格式时间字符串, 失败返回 None."""
+    try:
+        return datetime.fromisoformat(str(s))
+    except Exception:
+        return None
+
+
+def load_financials(path=FIN_CACHE_PATH):
+    """读取财务缓存 {code: {roes, profits, ccy, fetched_at}}."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_financials(cache, path=FIN_CACHE_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def _fetch_fresh_financial(code, market):
+    """拉新鲜财务, 返回 dict {roes, profits, ccy} 或 None.
+    三市场统一入口, 失败返回 None (不抛异常, 由调用方决定兜底).
+    """
     try:
         if market == "A":
             roes, profits = get_a_financial(code)
-            price = get_a_price(code)
+            ccy = "CNY"
         elif market == "HK":
             roes, profits = get_hk_financial(code)
+            ccy = "CNY"
+        elif market == "US":
+            roes, profits, ccy = get_us_financial(code)
+        else:
+            return None
+        if len(roes) >= 3 and len(profits) >= 3:
+            return {"roes": roes, "profits": profits, "ccy": ccy}
+    except Exception as e:
+        print(f"  财务拉取异常: {type(e).__name__}: {e}", flush=True)
+    return None
+
+
+def process_one(stock, prev=None, fin_cache=None, refresh_days=FIN_REFRESH_DAYS):
+    """处理单只股票, 返回 (record, fin_fresh_or_cached) 或 (None, None).
+    财务: 30 天内复用缓存, 超期或无缓存才拉新鲜; 拉不到用缓存兜底; 缓存也无 -> 裸奔失败.
+    价格: 总是拉新鲜, 失败用 prev["股价"] 兜底.
+    fin_cache: {code: {roes, profits, ccy, fetched_at}}, 由 main 传入并统一持久化.
+    返回 fin 用于 main 决定是否更新缓存(新鲜成功才更新).
+    """
+    code, market, name, shares_yi = stock
+    fin_cache = fin_cache if fin_cache is not None else {}
+    cached = fin_cache.get(code)
+    now = datetime.now(CN_TZ)
+
+    # 决定是否需要拉新鲜财务: 无缓存, 或缓存超 refresh_days
+    need_fresh = True
+    if cached:
+        fetched_at = _parse_iso_dt(cached.get("fetched_at"))
+        if fetched_at and (now - fetched_at).days < refresh_days:
+            need_fresh = False
+
+    fin = None
+    fin_is_fresh = False
+    if need_fresh:
+        fin = _fetch_fresh_financial(code, market)
+        if fin:
+            fin_is_fresh = True
+        elif cached:
+            print(f"  财务拉取失败, 用缓存兜底( fetched_at={cached.get('fetched_at')})", flush=True)
+            fin = cached
+    else:
+        fin = cached
+
+    # 财务彻底没有 (新股首跑失败, 且无缓存) -> 裸奔, 本次缺席, 下次再试
+    if not fin or len(fin.get("roes", [])) < 3 or len(fin.get("profits", [])) < 3:
+        return None, None
+
+    roes = fin["roes"]
+    profits = fin["profits"]
+    profit_ccy = fin.get("ccy", "CNY")
+
+    # 价格: 总是拉新鲜
+    price = 0.0
+    try:
+        if market == "A":
+            price = get_a_price(code)
+        elif market == "HK":
             price = get_hk_price(code, name)
         elif market == "US":
-            roes, profits, profit_ccy = get_us_financial(code)
             price = get_us_price(code, name)
     except Exception as e:
-        # 网络全挂时回退旧记录保底(宁可旧数据也不丢股票)
-        if prev:
-            print(f"  NET FAIL, 用上次数据保底: {type(e).__name__}", flush=True)
-            return prev
-        raise
+        print(f"  价格拉取异常: {type(e).__name__}: {e}", flush=True)
 
     # 价格拿不到 -> 用旧价格保底
     if price <= 0 and prev and prev.get("股价", 0) > 0:
         print(f"  价格缺失, 用上次股价 {prev['股价']} 保底", flush=True)
         price = prev["股价"]
-    # 财务拿不到 -> 用旧 ROE/利润保底
-    if (len(roes) < 3 or len(profits) < 3) and prev and prev.get("均值ROE", 0) > 0:
-        print(f"  财务缺失, 用上次财务保底", flush=True)
-        return prev
-
-    if len(roes) < 3 or len(profits) < 3 or price <= 0:
-        return None
+    # 价格仍拿不到 -> 用上次整条记录保底(财务已是缓存, 极少走到这)
+    if price <= 0 and prev:
+        print(f"  价格仍缺失, 用上次整条记录保底", flush=True)
+        return prev, None
+    if price <= 0:
+        return None, None
 
     rates = fx_rates()
     price_ccy = PRICE_CCY[market]
@@ -409,7 +554,7 @@ def process_one(stock, prev=None):
     mean_pe = round(market_cap / mean_profit_in_price, 2) if mean_profit_in_price != 0 else 0
     valuation_ratio = round(mean_pe / mean_roe, 2) if mean_roe != 0 else 0
 
-    return {
+    rec = {
         "证券简称": name,
         "代码": code,
         "市场": market,
@@ -427,6 +572,8 @@ def process_one(stock, prev=None):
         "均值PE": mean_pe,
         "估值比": valuation_ratio,
     }
+    # 返回的 fin 仅含数据字段(无 fetched_at), 由 main 补 fetched_at 后写缓存
+    return rec, ({"roes": roes, "profits": profits, "ccy": profit_ccy} if fin_is_fresh else None)
 
 
 def load_prev(path="data/valuation.json"):
@@ -450,10 +597,19 @@ def main():
         return
     cache = load_cache()
     prev_code, prev_name = load_prev()
+    fin_cache = load_financials()
+
+    # 新股优先: 无 prev 记录(从未成功输出过)的股票排最前, 趁 API 新鲜时先跑(限流随运行累积).
+    # 有 prev 的老股票放后面, 即使被限流也有 prev/缓存兜底.
+    new_codes = {s[0] for s in stocks if s[0] not in prev_code}
+    ordered = [s for s in stocks if s[0] in new_codes] + [s for s in stocks if s[0] not in new_codes]
+    print(f"股票池 {len(stocks)} 只: 新股(无prev) {len(new_codes)} 只优先, 老股 {len(stocks)-len(new_codes)} 只", flush=True)
+
     results = []
     failed = []
-    for i, (code, market, name, shares_readme) in enumerate(stocks, 1):
-        print(f"[{i}/{len(stocks)}] {name} ({market}:{code}) ...", flush=True)
+    for i, (code, market, name, shares_readme) in enumerate(ordered, 1):
+        tag = "新" if code in new_codes else "老"
+        print(f"[{i}/{len(ordered)}] [{tag}] {name} ({market}:{code}) ...", flush=True)
         try:
             # 确定股本(亿股): A 股自动查 -> README 手填 -> 缓存 -> 跳过
             if market == "A":
@@ -467,19 +623,23 @@ def main():
                 continue
 
             prev = prev_code.get(code) or prev_name.get(name)
-            rec = process_one((code, market, name, shares_yi), prev)
+            rec, fin_fresh = process_one((code, market, name, shares_yi), prev, fin_cache)
+            # 即使最终 rec=None(股本/价格失败), 已拿到的新鲜财务也写入缓存, 避免下次重拉
+            if fin_fresh:
+                fin_fresh["fetched_at"] = datetime.now(CN_TZ).isoformat()
+                fin_cache[code] = fin_fresh
             if rec is None:
-                # 最后兜底: 直接用上次记录
-                if prev:
-                    print(f"  SKIP: 数据不足, 用上次数据保底", flush=True)
-                    results.append(prev)
-                else:
-                    print(f"  SKIP: 数据不足且无历史数据", flush=True)
-                    failed.append(name)
+                # 财务与价格都拿不到, 且无 prev -> 真正失败, 下次再试
+                print(f"  SKIP: 财务/价格均缺失且无历史数据, 下次再试", flush=True)
+                failed.append(name)
                 continue
             results.append(rec)
-            cache[code] = shares_yi  # 更新缓存
-            print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 均值ROE={rec['均值ROE']}%", flush=True)
+            if fin_fresh:
+                print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 均值ROE={rec['均值ROE']}% (财务已更新缓存)", flush=True)
+            else:
+                src = "缓存" if fin_cache.get(code) else "prev"
+                print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 均值ROE={rec['均值ROE']}% (财务用{src})", flush=True)
+            cache[code] = shares_yi  # 更新股本缓存
         except Exception as e:
             print(f"  FAIL: {type(e).__name__}: {e}", flush=True)
             failed.append(name)
@@ -487,6 +647,7 @@ def main():
         time.sleep(0.4)  # 轻微限速, 避免被封
 
     save_cache(cache)
+    save_financials(fin_cache)  # 财务缓存持久化, 下次运行/新股下次就能兜底
     output = {
         "update_time": datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "total": len(stocks),
