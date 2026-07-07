@@ -191,17 +191,24 @@ def fx_rates():
 
 # ---------- A 股行情快照: 一次拉全市场, 避免逐只请求被限流 ----------
 _A_SPOT = None
+_A_SPOT_TRIES = 0
+_A_SPOT_MAX_TRIES = 3
 def a_spot_map():
     """返回 {code: {price, shares_yi, market_cap_yi}}.
     东方财富 A 股全市场快照含最新价与总市值; 股本 = 总市值 / 最新价。
     失败时返回空 dict, 后续会用逐只接口/缓存兜底。
+    关键: 失败不缓存空结果, 允许后续股票重试(单次运行最多 _A_SPOT_MAX_TRIES 次),
+    应对瞬时网络中断(RemoteDisconnected 等)——否则一次抖动会让整轮 99 只全走逐只兜底被限流。
     """
-    global _A_SPOT
+    global _A_SPOT, _A_SPOT_TRIES
     if _A_SPOT is not None:
         return _A_SPOT
+    if _A_SPOT_TRIES >= _A_SPOT_MAX_TRIES:
+        return {}
+    _A_SPOT_TRIES += 1
     out = {}
     try:
-        df = with_retry(lambda: ak.stock_zh_a_spot_em(), attempts=1, secs=45)
+        df = with_retry(lambda: ak.stock_zh_a_spot_em(), attempts=2, secs=45)
         for _, row in df.iterrows():
             code = str(row.get("代码", "")).zfill(6)
             price = clean_number(row.get("最新价"))
@@ -212,9 +219,11 @@ def a_spot_map():
                     "shares_yi": market_cap_yuan / price / 1e8,
                     "market_cap_yi": market_cap_yuan / 1e8,
                 }
+        _A_SPOT = out  # 仅成功时缓存, 失败不缓存以便后续股票重试
+        if _A_SPOT_TRIES > 1:
+            print(f"A股快照第 {_A_SPOT_TRIES} 次尝试恢复成功: {len(out)} 只", flush=True)
     except Exception as e:
-        print(f"A股快照不可用, 将走逐只/缓存兜底: {type(e).__name__}: {e}", flush=True)
-    _A_SPOT = out
+        print(f"A股快照不可用(尝试 {_A_SPOT_TRIES}/{_A_SPOT_MAX_TRIES}), 将走逐只/缓存兜底: {type(e).__name__}: {e}", flush=True)
     return out
 
 
