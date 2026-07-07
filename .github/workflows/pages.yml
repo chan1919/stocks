@@ -33,7 +33,7 @@ jobs:
           import json, sys
           for f in ['data/valuation.json', 'data/shares_cache.json', 'data/financials.json']:
             try:
-              json.load(open(f))
+              json.load(open(f, encoding='utf-8'))
               print(f'{f}: OK')
             except Exception as e:
               print(f'{f}: INVALID - {e}')
