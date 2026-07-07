@@ -28,20 +28,6 @@
   .meta span { margin-left: 14px; }
   .meta b { color: #0f172a; }
 
-  /* 紧凑渐变图例 */
-  .legend {
-    display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
-    font-size: 12px; color: #64748b;
-  }
-  .legend .bar {
-    width: 220px; height: 12px; border-radius: 6px; border: 1px solid #e2e8f0;
-    background: linear-gradient(90deg,
-      hsl(140,65%,42%), hsl(100,60%,50%), hsl(60,65%,55%),
-      hsl(30,70%,52%), hsl(0,70%,45%));
-  }
-  .legend .ends { display: flex; justify-content: space-between; width: 220px; margin-top: 2px; font-size: 11px; }
-  .legend .wrap { display: flex; flex-direction: column; }
-
   .table-wrap {
     background: #ffffff;
     border: 1px solid #e2e8f0;
@@ -111,14 +97,6 @@
     </div>
   </header>
 
-  <div class="legend">
-    <span>估值比</span>
-    <div class="wrap">
-      <div class="bar"></div>
-      <div class="ends"><span>低估 0</span><span>合理 1</span><span>高估 2+</span></div>
-    </div>
-  </div>
-
   <div class="table-wrap">
     <table id="table">
       <thead>
@@ -156,26 +134,21 @@ const COLS = [
   { key: "估值比",  label: "估值比",  align: "right", fmt: v => v, ratio: true },
 ];
 
-// 估值比颜色: 0 -> 深绿, 1 -> 黄(中性), 2 -> 红, >2 -> 更深红. 绿->黄->红 自然过渡.
+// 估值比颜色: 0 -> 深绿, 1 -> 黄, 2 -> 红, >2 -> 更深红. 统一白字保证可读性.
 function ratioColor(r) {
-  if (r == null || isNaN(r)) return { bg: "#f1f5f9", fg: "#94a3b8" };
-  // 把 r 映射到 t in [0,1]: r=0 -> 0, r=2 -> 1, 超过 2 截断
+  if (r == null || isNaN(r)) return { bg: "#e2e8f0", fg: "#64748b" };
   const t = Math.min(r / 2, 1);
   // 色相 140(绿) -> 60(黄) -> 0(红) 线性过渡
   const hue = 140 - 140 * t;
-  // 亮度: 中段(黄)稍亮, 两端稍深, 保持白底可读
-  const L = 52 - 6 * Math.abs(t - 0.5) * 2;   // 52 -> 46
   const S = 62;
-  // r>2 时进一步加深红色, 强化"严重高估"
+  // 亮度统一 46, 保证白字在所有色相下都有足够对比度
+  const L = 46;
+  // r > 2 时进一步加深红色, 强化"严重高估"
   if (r > 2) {
     const ex = Math.min((r - 2) / 2, 1);
-    const L2 = L - ex * 16;                   // 46 -> 30
-    return { bg: `hsl(0, 70%, ${L2}%)`, fg: L2 < 40 ? "#fff" : "#7f1d1d" };
+    return { bg: `hsl(0, ${S}%, ${L - ex * 16}%)`, fg: "#fff" };
   }
-  const bg = `hsl(${hue}, ${S}%, ${L}%)`;
-  // 绿端与红端用白字, 中段黄/橙用深字, 保证对比度
-  const fg = (t < 0.30 || t > 0.85) ? "#ffffff" : "#1e293b";
-  return { bg, fg };
+  return { bg: `hsl(${hue}, ${S}%, ${L}%)`, fg: "#fff" };
 }
 
 let DATA = [];

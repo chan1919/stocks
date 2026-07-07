@@ -695,22 +695,16 @@ def main():
         tag = "新" if code in new_codes else "老"
         print(f"[{i}/{len(ordered)}] [{tag}] {name} ({market}:{code}) ...", flush=True)
         try:
-            # 确定股本(亿股):
-            # A 股: 快照/东财/腾讯自动查 -> README 手填 -> 缓存 -> 跳过
-            # 港美股: 腾讯自动查 -> README 手填 -> 缓存 -> 跳过
-            if market == "A":
-                fallback = shares_readme if shares_readme else cache.get(code)
-                shares_yi = get_shares_a(code, fallback=fallback)
-            else:
-                shares_yi = shares_readme if shares_readme else cache.get(code)
-                # 港美股: 尝试腾讯自动查股本 (不限流, 比手填更及时)
-                if not shares_yi or shares_yi <= 0:
-                    q = _tencent_quote(code, market)
-                    shares_yi = q.get("shares_yi", 0) or None
-                    if shares_yi:
-                        print(f"  腾讯查到股本: {shares_yi:.2f}亿股", flush=True)
+            # 股本(亿股): 腾讯为主源(三市场统一,不限流) -> A股东财快照兜底 -> 缓存 -> 跳过
+            shares_yi = None
+            q = _tencent_quote(code, market)
+            shares_yi = q.get("shares_yi", 0) or None
+            if not shares_yi and market == "A":
+                shares_yi = get_shares_a(code, fallback=cache.get(code))
+            if not shares_yi:
+                shares_yi = shares_readme or cache.get(code)
             if not shares_yi or shares_yi <= 0:
-                print(f"  SKIP: 缺少股本(自动查失败且无缓存/手填值)", flush=True)
+                print(f"  SKIP: 缺少股本(腾讯/东财均失败且无缓存)", flush=True)
                 failed.append(name)
                 continue
 
