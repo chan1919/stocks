@@ -28,17 +28,14 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      - name: Validate JSON files
-        run: python -c "
-          import json, sys
-          for f in ['data/valuation.json', 'data/shares_cache.json', 'data/financials.json']:
-            try:
-              json.load(open(f, encoding='utf-8'))
-              print(f'{f}: OK')
-            except Exception as e:
-              print(f'{f}: INVALID - {e}')
-              sys.exit(1)
-        "
+      - name: Check for conflict markers and validate JSON
+        run: |
+          if grep -rn '<<<<<<<\|>>>>>>>' data/; then
+            echo "ERROR: git merge conflict markers found in data/ files!"
+            exit 1
+          fi
+          python -c "import json; [json.load(open(f, encoding='utf-8')) for f in ['data/valuation.json', 'data/shares_cache.json', 'data/financials.json']]"
+          echo "All JSON files valid"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

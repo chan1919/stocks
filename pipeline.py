@@ -243,20 +243,50 @@ def a_spot_map():
     return out
 
 
-def _tencent_shares(code):
-    """腾讯证券接口查总股本(亿股), 作 A 股股本最后兜底.
-    腾讯 qt.gtimg.cn 返回 field73=总股本(股), field72=流通A股(股).
-    总股本含 A+H + 国有股, 对非全流通/A+H公司准确 (如中国海油总股本475亿, 流通A仅29.9亿).
-    腾讯不限流(不同于东财), 是东财整域名被限流时的可靠兜底.
+def _tencent_symbol(code, market):
+    """腾讯行情符号: A股 sh/sz, 港股 hk, 美股 us."""
+    if market == "A":
+        return ("sh" if code.startswith("6") else "sz") + code
+    if market == "HK":
+        return "hk" + code
+    return "us" + code
+
+
+def _tencent_quote(code, market):
+    """腾讯证券统一行情 (三市场), 返回 {price, shares_yi, market_cap_yi} 或 {}.
+    qt.gtimg.cn 不限流, 三市场统一, 比 东方财富/网易 稳定得多.
+    字段位置因市场而异:
+      A股: price=f3, 总股本=f73(股), 市值=f44(亿)
+      港股: price=f3, 总股本=f69(股), 市值=f44(亿)
+      美股: price=f3, 总股本=f62(股), 市值=f44(亿)
     """
-    prefix = "sh" if code.startswith("6") else "sz"
+    sym = _tencent_symbol(code, market)
+    shares_idx = {"A": 73, "HK": 69, "US": 62}[market]
     try:
-        r = HTTP.get(f"http://qt.gtimg.cn/q={prefix}{code}", timeout=8)
+        r = HTTP.get(f"http://qt.gtimg.cn/q={sym}", timeout=8)
         fields = r.text.split("~")
-        total = clean_number(fields[73]) / 1e8  # 股 -> 亿股
-        return total if total > 0 else None
+        if len(fields) < 10:
+            return {}
+        price = clean_number(fields[3])
+        shares = clean_number(fields[shares_idx]) / 1e8 if len(fields) > shares_idx else 0  # 股 -> 亿股
+        mcap = clean_number(fields[44]) if len(fields) > 44 else 0  # 亿
+        out = {}
+        if price > 0:
+            out["price"] = price
+        if shares > 0:
+            out["shares_yi"] = shares
+        if mcap > 0:
+            out["market_cap_yi"] = mcap
+        return out
     except Exception:
-        return None
+        return {}
+
+
+def _tencent_shares(code):
+    """腾讯证券接口查 A 股总股本(亿股), 保留旧接口名供 get_shares_a 调用."""
+    q = _tencent_quote(code, "A")
+    s = q.get("shares_yi", 0)
+    return s if s > 0 else None
 
 
 def get_shares_a(code, fallback=None):
@@ -361,13 +391,16 @@ def get_a_financial(code):
 
 
 def get_a_price(code):
-    """A 股最新价: 优先东方财富实时报价, 失败回退新浪日报昨收."""
+    """A 股最新价: 优先东方财富全市场快照, 失败回退 push2 实时, 再腾讯, 最后新浪日报."""
     spot = a_spot_map().get(code)
     if spot and spot.get("price", 0) > 0:
         return spot["price"]
     p = _em_quote_price(_a_secid(code))
     if p:
         return p
+    q = _tencent_quote(code, "A")
+    if q.get("price", 0) > 0:
+        return q["price"]
     prefix = "sh" if code.startswith("6") else "sz"
     df = with_retry(lambda: ak.stock_zh_a_daily(symbol=prefix + code, adjust=""))
     return float(df["close"].iloc[-1])
@@ -416,7 +449,10 @@ def _us_secid_candidates(code):
 
 # ---------- 港股 ----------
 def get_hk_price(code, name=None):
-    """港股最新价: 优先东方财富实时报价, 失败回退网易日报昨收."""
+    """港股最新价: 优先腾讯(不限流), 失败回退东方财富, 再回退网易日报."""
+    q = _tencent_quote(code, "HK")
+    if q.get("price", 0) > 0:
+        return q["price"]
     p = _em_quote_price(f"116.{code}")
     if p:
         return p
@@ -440,7 +476,10 @@ def get_hk_financial(code):
 
 # ---------- 美股 ----------
 def get_us_price(code, name=None):
-    """美股最新价: 优先东方财富实时报价(尝试 NASDAQ/NYSE/AMEX), 失败回退网易日报昨收."""
+    """美股最新价: 优先腾讯(不限流), 失败回退东方财富(尝试 NASDAQ/NYSE/AMEX), 再回退网易日报."""
+    q = _tencent_quote(code, "US")
+    if q.get("price", 0) > 0:
+        return q["price"]
     for secid in _us_secid_candidates(code):
         p = _em_quote_price(secid)
         if p:
@@ -656,14 +695,22 @@ def main():
         tag = "新" if code in new_codes else "老"
         print(f"[{i}/{len(ordered)}] [{tag}] {name} ({market}:{code}) ...", flush=True)
         try:
-            # 确定股本(亿股): A 股自动查 -> README 手填 -> 缓存 -> 跳过
+            # 确定股本(亿股):
+            # A 股: 快照/东财/腾讯自动查 -> README 手填 -> 缓存 -> 跳过
+            # 港美股: 腾讯自动查 -> README 手填 -> 缓存 -> 跳过
             if market == "A":
                 fallback = shares_readme if shares_readme else cache.get(code)
                 shares_yi = get_shares_a(code, fallback=fallback)
             else:
                 shares_yi = shares_readme if shares_readme else cache.get(code)
+                # 港美股: 尝试腾讯自动查股本 (不限流, 比手填更及时)
+                if not shares_yi or shares_yi <= 0:
+                    q = _tencent_quote(code, market)
+                    shares_yi = q.get("shares_yi", 0) or None
+                    if shares_yi:
+                        print(f"  腾讯查到股本: {shares_yi:.2f}亿股", flush=True)
             if not shares_yi or shares_yi <= 0:
-                print(f"  SKIP: 缺少股本(A股自动查失败且无缓存/手填值)", flush=True)
+                print(f"  SKIP: 缺少股本(自动查失败且无缓存/手填值)", flush=True)
                 failed.append(name)
                 continue
 
