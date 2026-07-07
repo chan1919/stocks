@@ -195,10 +195,11 @@ _A_SPOT_TRIES = 0
 _A_SPOT_MAX_TRIES = 3
 def a_spot_map():
     """返回 {code: {price, shares_yi, market_cap_yi}}.
-    东方财富 A 股全市场快照含最新价与总市值; 股本 = 总市值 / 最新价。
-    失败时返回空 dict, 后续会用逐只接口/缓存兜底。
-    关键: 失败不缓存空结果, 允许后续股票重试(单次运行最多 _A_SPOT_MAX_TRIES 次),
-    应对瞬时网络中断(RemoteDisconnected 等)——否则一次抖动会让整轮 99 只全走逐只兜底被限流。
+    直接请求东方财富 clist 全市场快照 (f12=代码 f14=名称 f2=最新价 f20=总市值),
+    股本 = 总市值 / 最新价 / 1e8.
+    不依赖 ak.stock_zh_a_spot_em: akshare 内部 requests 不带 Referer/UA, 易被东财
+    RemoteDisconnected; 项目 HTTP session 带了 Referer=eastmoney 稳定可用.
+    失败不缓存空结果, 整轮内最多重试 _A_SPOT_MAX_TRIES 次, 应对瞬时网络抖动.
     """
     global _A_SPOT, _A_SPOT_TRIES
     if _A_SPOT is not None:
@@ -208,16 +209,31 @@ def a_spot_map():
     _A_SPOT_TRIES += 1
     out = {}
     try:
-        df = with_retry(lambda: ak.stock_zh_a_spot_em(), attempts=2, secs=45)
-        for _, row in df.iterrows():
-            code = str(row.get("代码", "")).zfill(6)
-            price = clean_number(row.get("最新价"))
-            market_cap_yuan = clean_number(row.get("总市值"))
-            if code and price > 0 and market_cap_yuan > 0:
+        all_data = []
+        for pn in range(1, 4):  # 分页拉, 每页 2000, A 股约 5500 只
+            r = HTTP.get(
+                "https://push2.eastmoney.com/api/qt/clist/get",
+                params={
+                    "pn": pn, "pz": 2000, "po": 1, "np": 1,
+                    "fltt": "2", "invt": "2",
+                    "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+                    "fields": "f12,f14,f2,f20",
+                },
+                timeout=15,
+            )
+            diff = (r.json().get("data") or {}).get("diff") or []
+            if not diff:
+                break
+            all_data.extend(diff)
+        for x in all_data:
+            code = str(x.get("f12", "")).zfill(6)
+            price = clean_number(x.get("f2"))
+            mcap = clean_number(x.get("f20"))
+            if code and price > 0 and mcap > 0:
                 out[code] = {
                     "price": price,
-                    "shares_yi": market_cap_yuan / price / 1e8,
-                    "market_cap_yi": market_cap_yuan / 1e8,
+                    "shares_yi": mcap / price / 1e8,
+                    "market_cap_yi": mcap / 1e8,
                 }
         _A_SPOT = out  # 仅成功时缓存, 失败不缓存以便后续股票重试
         if _A_SPOT_TRIES > 1:
@@ -227,12 +243,24 @@ def a_spot_map():
     return out
 
 
+def _sina_daily_shares(code):
+    """新浪 stock_zh_a_daily 兜底查流通股(亿股), 作 A 股股本最后兜底.
+    outstanding_share 是流通股, 全流通公司 = 总股本; 非全流通偏低, 但比 SKIP 强.
+    新浪 daily 不限流(老股价格已走此接口), 适合东财整域名被限时的新股兜底.
+    """
+    prefix = "sh" if code.startswith("6") else "sz"
+    df = with_retry(lambda: ak.stock_zh_a_daily(symbol=prefix + code, adjust=""))
+    v = clean_number(df["outstanding_share"].iloc[-1]) / 1e8  # 股 -> 亿股
+    return v if v > 0 else None
+
+
 def get_shares_a(code, fallback=None):
     """A 股总股本(亿股), 多源兜底:
     1) A 股全市场快照 (总市值/最新价, 避免逐只限流)
     2) push2 实时报价 f84
     3) stock_individual_info_em
-    4) fallback (README 手填或缓存值)
+    4) 新浪 stock_zh_a_daily 流通股 (东财整域名被限时的关键兜底)
+    5) fallback (README 手填或缓存值)
     """
     spot = a_spot_map().get(code)
     if spot and spot.get("shares_yi", 0) > 0:
@@ -250,6 +278,9 @@ def get_shares_a(code, fallback=None):
                 return v
     except Exception:
         pass
+    s = _sina_daily_shares(code)
+    if s and s > 0:
+        return s
     return fallback
 
 
