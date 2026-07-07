@@ -364,7 +364,8 @@ def _get_a_financial_em(code):
     except Exception:
         return [], []
     # 筛年报(12-31), 已按 REPORTDATE 降序, 取最近 3 年
-    annual = [x for x in rows if str(x.get("REPORTDATE", "")).endswith("12-31")][:3]
+    # 注意: 东财返回日期格式为 "2025-12-31 00:00:00", 用 [:10] 截取日期部分再判断
+    annual = [x for x in rows if str(x.get("REPORTDATE", ""))[:10].endswith("12-31")][:3]
     if len(annual) < 3:
         return [], []
     roes = [clean_number(x.get("WEIGHTAVG_ROE")) for x in annual]
