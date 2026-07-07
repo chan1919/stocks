@@ -700,8 +700,16 @@ def main():
         "failed": failed,
         "data": results,
     }
-    with open("data/valuation.json", "w", encoding="utf-8") as f:
+    out_path = "data/valuation.json"
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
+    # 验证输出文件可被 JSON 解析 (防御 git merge conflict 标记等意外)
+    try:
+        with open(out_path, "r", encoding="utf-8") as f:
+            json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"\nFATAL: 写入 {out_path} 后 JSON 校验失败: {e}", flush=True)
+        raise SystemExit(1)
     print(f"\nDONE: 成功 {len(results)} / 失败 {len(failed)}", flush=True)
     if failed:
         print("失败列表:", ", ".join(failed), flush=True)

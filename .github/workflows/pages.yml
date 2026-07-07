@@ -28,6 +28,18 @@ jobs:
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
+      - name: Validate JSON files
+        run: python -c "
+          import json, sys
+          for f in ['data/valuation.json', 'data/shares_cache.json', 'data/financials.json']:
+            try:
+              json.load(open(f))
+              print(f'{f}: OK')
+            except Exception as e:
+              print(f'{f}: INVALID - {e}')
+              sys.exit(1)
+        "
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
