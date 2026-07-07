@@ -243,16 +243,20 @@ def a_spot_map():
     return out
 
 
-def _sina_daily_shares(code):
-    """新浪 stock_zh_a_daily 兜底查流通股(亿股), 作 A 股股本最后兜底.
-    outstanding_share 是流通A股, 全流通公司 = 总股本; 含国有股/A+H 等非全流通公司
-    (如中国海油总股本475亿, 流通A股仅29.9亿) 会严重偏低, 故仅在无缓存/手填时使用.
-    新浪 daily 不限流(老股价格已走此接口), 适合东财整域名被限时的新股兜底.
+def _tencent_shares(code):
+    """腾讯证券接口查总股本(亿股), 作 A 股股本最后兜底.
+    腾讯 qt.gtimg.cn 返回 field73=总股本(股), field72=流通A股(股).
+    总股本含 A+H + 国有股, 对非全流通/A+H公司准确 (如中国海油总股本475亿, 流通A仅29.9亿).
+    腾讯不限流(不同于东财), 是东财整域名被限流时的可靠兜底.
     """
     prefix = "sh" if code.startswith("6") else "sz"
-    df = with_retry(lambda: ak.stock_zh_a_daily(symbol=prefix + code, adjust=""))
-    v = clean_number(df["outstanding_share"].iloc[-1]) / 1e8  # 股 -> 亿股
-    return v if v > 0 else None
+    try:
+        r = HTTP.get(f"http://qt.gtimg.cn/q={prefix}{code}", timeout=8)
+        fields = r.text.split("~")
+        total = clean_number(fields[73]) / 1e8  # 股 -> 亿股
+        return total if total > 0 else None
+    except Exception:
+        return None
 
 
 def get_shares_a(code, fallback=None):
@@ -260,8 +264,8 @@ def get_shares_a(code, fallback=None):
     1) A 股全市场快照 (总市值/最新价, 避免逐只限流)
     2) push2 实时报价 f84
     3) stock_individual_info_em
-    4) fallback (README 手填或缓存值) — 优先于新浪, 因缓存含总股本(含国有股), 新浪仅流通A股
-    5) 新浪 stock_zh_a_daily 流通股 (仅无缓存/手填时用, 新股市本可能偏低但胜过 SKIP)
+    4) 腾讯证券总股本 (东财限流兜底, 对非全流通/A+H公司准确, 优先于旧缓存)
+    5) fallback (README 手填或缓存值)
     """
     spot = a_spot_map().get(code)
     if spot and spot.get("shares_yi", 0) > 0:
@@ -279,12 +283,10 @@ def get_shares_a(code, fallback=None):
                 return v
     except Exception:
         pass
-    if fallback and fallback > 0:
-        return fallback
-    s = _sina_daily_shares(code)
+    s = _tencent_shares(code)
     if s and s > 0:
         return s
-    return None
+    return fallback
 
 
 # ---------- A 股 ----------
