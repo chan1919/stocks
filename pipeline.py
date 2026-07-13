@@ -253,15 +253,17 @@ def _tencent_symbol(code, market):
 
 
 def _tencent_quote(code, market):
-    """腾讯证券统一行情 (三市场), 返回 {price, shares_yi, market_cap_yi} 或 {}.
+    """腾讯证券统一行情 (三市场), 返回 {price, shares_yi, market_cap_yi, div_yield} 或 {}.
     qt.gtimg.cn 不限流, 三市场统一, 比 东方财富/网易 稳定得多.
     字段位置因市场而异:
-      A股: price=f3, 总股本=f73(股), 市值=f44(亿)
-      港股: price=f3, 总股本=f69(股), 市值=f44(亿)
-      美股: price=f3, 总股本=f62(股), 市值=f44(亿)
+      A股: price=f3, 总股本=f73(股), 市值=f44(亿), 无股息率字段
+      港股: price=f3, 总股本=f69(股), 市值=f44(亿), 股息率=f47(%)
+      美股: price=f3, 总股本=f62(股), 市值=f44(亿), 股息率=f52(%)
+    div_yield 为零或缺失时不写入, 由调用方按 0 处理.
     """
     sym = _tencent_symbol(code, market)
     shares_idx = {"A": 73, "HK": 69, "US": 62}[market]
+    div_idx = {"A": None, "HK": 47, "US": 52}[market]
     try:
         r = HTTP.get(f"http://qt.gtimg.cn/q={sym}", timeout=8)
         fields = r.text.split("~")
@@ -277,6 +279,10 @@ def _tencent_quote(code, market):
             out["shares_yi"] = shares
         if mcap > 0:
             out["market_cap_yi"] = mcap
+        if div_idx is not None and len(fields) > div_idx:
+            dy = clean_number(fields[div_idx])
+            if dy > 0:
+                out["div_yield"] = dy
         return out
     except Exception:
         return {}
@@ -405,6 +411,34 @@ def get_a_price(code):
     prefix = "sh" if code.startswith("6") else "sz"
     df = with_retry(lambda: ak.stock_zh_a_daily(symbol=prefix + code, adjust=""))
     return float(df["close"].iloc[-1])
+
+
+# ---------- A 股股息 (TTM 每股股息) ----------
+def get_a_dividend_dps(code):
+    """A 股 TTM 每股股息(元), 用 stock_fhps_detail_em 的实施分配记录.
+    按除权除息日筛选近 365 天, 累加 现金分红-现金分红比例 / 10 (10派X元 -> X/10 元/股).
+    失败返回 0.0, 不抛异常.
+    """
+    try:
+        df = with_retry(lambda: ak.stock_fhps_detail_em(symbol=code))
+        if df is None or df.empty:
+            return 0.0
+        if "方案进度" not in df.columns or "除权除息日" not in df.columns:
+            return 0.0
+        df = df[df["方案进度"] == "实施分配"]
+        div_col = "现金分红-现金分红比例" if "现金分红-现金分红比例" in df.columns else None
+        if div_col is None:
+            return 0.0
+        now = datetime.now(CN_TZ).replace(tzinfo=None)
+        cutoff = now - timedelta(days=365)
+        dps = 0.0
+        for _, row in df.iterrows():
+            ex_date = _parse_iso_dt(str(row.get("除权除息日", ""))[:10])
+            if ex_date and ex_date > cutoff:
+                dps += clean_number(row.get(div_col)) / 10.0
+        return round(dps, 4)
+    except Exception:
+        return 0.0
 
 
 # ---------- 实时行情/股本 (东方财富 push2, 轻量带超时, GitHub 可用) ----------
@@ -537,33 +571,38 @@ def save_financials(cache, path=FIN_CACHE_PATH):
 
 
 def _fetch_fresh_financial(code, market):
-    """拉新鲜财务, 返回 dict {roes, profits, ccy} 或 None.
+    """拉新鲜财务, 返回 dict {roes, profits, ccy, dps} 或 None.
     三市场统一入口, 失败返回 None (不抛异常, 由调用方决定兜底).
+    dps(每股股息) 仅 A 股通过 stock_fhps_detail_em 获取; 港股/美股股息率由腾讯行情直接给, 此处置 0.
     """
     try:
         if market == "A":
             roes, profits = get_a_financial(code)
             ccy = "CNY"
+            dps = get_a_dividend_dps(code)
         elif market == "HK":
             roes, profits = get_hk_financial(code)
             ccy = "CNY"
+            dps = 0.0
         elif market == "US":
             roes, profits, ccy = get_us_financial(code)
+            dps = 0.0
         else:
             return None
         if len(roes) >= 3 and len(profits) >= 3:
-            return {"roes": roes, "profits": profits, "ccy": ccy}
+            return {"roes": roes, "profits": profits, "ccy": ccy, "dps": dps}
     except Exception as e:
         print(f"  财务拉取异常: {type(e).__name__}: {e}", flush=True)
     return None
 
 
-def process_one(stock, prev=None, fin_cache=None, refresh_days=FIN_REFRESH_DAYS):
+def process_one(stock, prev=None, fin_cache=None, refresh_days=FIN_REFRESH_DAYS, div_yield_hk_us=None):
     """处理单只股票, 返回 (record, fin_fresh_or_cached) 或 (None, None).
     财务: 30 天内复用缓存, 超期或无缓存才拉新鲜; 拉不到用缓存兜底; 缓存也无 -> 裸奔失败.
     价格: 总是拉新鲜, 失败用 prev["股价"] 兜底.
-    fin_cache: {code: {roes, profits, ccy, fetched_at}}, 由 main 传入并统一持久化.
-    返回 fin 用于 main 决定是否更新缓存(新鲜成功才更新).
+    股息率: A 股 = 缓存 dps / 当日股价 × 100 (dps 随财务 30 天刷新); 港股/美股 = 腾讯行情直给 div_yield_hk_us.
+    fin_cache: {code: {roes, profits, ccy, dps, fetched_at}}, 由 main 传入并统一持久化.
+    返回 fin 用于 main 决定是否更新缓存(新鲜成功或补 dps 才更新).
     """
     code, market, name, shares_yi = stock
     fin_cache = fin_cache if fin_cache is not None else {}
@@ -596,6 +635,12 @@ def process_one(stock, prev=None, fin_cache=None, refresh_days=FIN_REFRESH_DAYS)
     roes = fin["roes"]
     profits = fin["profits"]
     profit_ccy = fin.get("ccy", "CNY")
+
+    # A 股 dps: 老缓存可能没有 dps 字段, 单独补拉一次并写回缓存 (fin 即 cached 同一对象, main 末尾 save_financials 持久化)
+    fin_dps_updated = False
+    if market == "A" and fin.get("dps") is None:
+        fin["dps"] = get_a_dividend_dps(code)
+        fin_dps_updated = True
 
     # 价格: 总是拉新鲜
     price = 0.0
@@ -639,6 +684,13 @@ def process_one(stock, prev=None, fin_cache=None, refresh_days=FIN_REFRESH_DAYS)
     mean_pe = round(market_cap / mean_profit_in_price, 2) if mean_profit_in_price != 0 else 0
     valuation_ratio = round(mean_pe / mean_roe, 2) if mean_roe != 0 else 0
 
+    # 股息率(%): A 股用 dps/股价, 港股/美股用腾讯行情直给值
+    if market == "A":
+        dps = fin.get("dps", 0) or 0
+        div_yield = round(dps / price * 100, 2) if price > 0 and dps > 0 else 0
+    else:
+        div_yield = round(div_yield_hk_us or 0, 2)
+
     rec = {
         "证券简称": name,
         "代码": code,
@@ -655,10 +707,14 @@ def process_one(stock, prev=None, fin_cache=None, refresh_days=FIN_REFRESH_DAYS)
         "利润3": round(p3, 2),
         "均值利润": mean_profit,
         "均值PE": mean_pe,
+        "股息率": div_yield,
         "估值比": valuation_ratio,
     }
     # 返回的 fin 仅含数据字段(无 fetched_at), 由 main 补 fetched_at 后写缓存
-    return rec, ({"roes": roes, "profits": profits, "ccy": profit_ccy} if fin_is_fresh else None)
+    # fin_is_fresh: 全量财务刚拉; fin_dps_updated: 老缓存补了 dps — 都需写回缓存
+    if fin_is_fresh or fin_dps_updated:
+        return rec, {"roes": roes, "profits": profits, "ccy": profit_ccy, "dps": fin.get("dps", 0)}
+    return rec, None
 
 
 def load_prev(path="data/valuation.json"):
@@ -710,7 +766,8 @@ def main():
                 continue
 
             prev = prev_code.get(code) or prev_name.get(name)
-            rec, fin_fresh = process_one((code, market, name, shares_yi), prev, fin_cache)
+            rec, fin_fresh = process_one((code, market, name, shares_yi), prev, fin_cache,
+                                        div_yield_hk_us=q.get("div_yield"))
             # 即使最终 rec=None(股本/价格失败), 已拿到的新鲜财务也写入缓存, 避免下次重拉
             if fin_fresh:
                 fin_fresh["fetched_at"] = datetime.now(CN_TZ).isoformat()
@@ -722,10 +779,10 @@ def main():
                 continue
             results.append(rec)
             if fin_fresh:
-                print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 均值ROE={rec['均值ROE']}% (财务已更新缓存)", flush=True)
+                print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 股息率={rec['股息率']}% 均值ROE={rec['均值ROE']}% (财务已更新缓存)", flush=True)
             else:
                 src = "缓存" if fin_cache.get(code) else "prev"
-                print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 均值ROE={rec['均值ROE']}% (财务用{src})", flush=True)
+                print(f"  OK  PE={rec['均值PE']} 估值比={rec['估值比']} 股息率={rec['股息率']}% 均值ROE={rec['均值ROE']}% (财务用{src})", flush=True)
             cache[code] = shares_yi  # 更新股本缓存
         except Exception as e:
             print(f"  FAIL: {type(e).__name__}: {e}", flush=True)

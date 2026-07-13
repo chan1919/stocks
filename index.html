@@ -115,7 +115,7 @@
 </div>
 
 <script>
-const KEY_COLS = new Set(["股价", "均值ROE", "均值PE", "均值利润"]);
+const KEY_COLS = new Set(["股价", "均值ROE", "均值PE", "均值利润", "股息率"]);
 
 const COLS = [
   { key: "证券简称", label: "证券简称", align: "left",  fmt: v => v },
@@ -131,6 +131,7 @@ const COLS = [
   { key: "利润3",   label: "利润3(亿)",align: "right",fmt: v => v },
   { key: "均值利润",label: "均值利润(亿)",align:"right",fmt: v=>v },
   { key: "均值PE",  label: "均值PE",  align: "right", fmt: v => v },
+  { key: "股息率",  label: "股息率%", align: "right", fmt: v => (v ? v : "—") },
   { key: "估值比",  label: "估值比",  align: "right", fmt: v => v, ratio: true },
 ];
 
