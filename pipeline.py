@@ -83,6 +83,8 @@ def parse_readme(path=README_PATH):
             if len(parts) < 2:
                 continue
             code, name = parts[0], parts[1]
+            if market == "A" and code.startswith("9"):
+                continue  # 屏蔽北交所 A 股(9 开头), 数据接口不稳定
             if code in seen:
                 continue  # 去重: 同代码只保留首次
             seen.add(code)
