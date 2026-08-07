@@ -13,6 +13,7 @@ permissions:
   contents: write
   pages: write
   id-token: write
+  actions: write
 
 concurrency:
   group: valuation-update
@@ -58,13 +59,22 @@ jobs:
           fi
 
       - name: Commit and push
+        id: commit_push
         run: |
           git config user.name "Valuation Bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/valuation.json data/shares_cache.json data/financials.json
-          git diff --staged --quiet || git commit -m "chore: daily valuation update $(TZ=Asia/Shanghai date '+%Y-%m-%d')"
+          git diff --staged --quiet && echo "no-data-change=true" >> "$GITHUB_OUTPUT" || true
+          git commit -m "chore: daily valuation update $(TZ=Asia/Shanghai date '+%Y-%m-%d')" || true
           git pull --rebase origin main
           git push
+
+      - name: Deploy to Pages
+        if: steps.commit_push.outputs.no-data-change != 'true'
+        run: |
+          gh workflow run pages.yml --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Keepalive - update timestamp file (monthly)
         if: github.event_name == 'schedule' && github.event.schedule == '0 0 1 * *'
