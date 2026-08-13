@@ -84,6 +84,26 @@
   @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
 
   .footer { margin-top: 16px; font-size: 11px; color: #94a3b8; text-align: center; line-height: 1.6; }
+
+  /* ===== 移动端适配 ===== */
+  @media (max-width: 768px) {
+    body { padding: 12px; }
+    header { flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 12px; }
+    h1 { font-size: 20px; }
+    h1 .sub { display: block; margin-left: 0; margin-top: 2px; }
+    .meta { font-size: 12px; line-height: 1.8; }
+    .meta span { margin-left: 0; margin-right: 12px; }
+
+    .table-wrap {
+      border-radius: 8px;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    table { font-size: 12px; min-width: 760px; }
+    thead th { padding: 9px 6px; }
+    tbody td { padding: 8px 6px; }
+    td.ratio { font-size: 13px; }
+  }
 </style>
 </head>
 <body>
